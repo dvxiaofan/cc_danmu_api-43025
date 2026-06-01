@@ -1,11 +1,12 @@
 import BaseSource from './base.js';
 import { log } from "../utils/log-util.js";
 import { buildQueryString, httpGet} from "../utils/http-util.js";
-import { printFirst200Chars, titleMatches } from "../utils/common-util.js";
-import { md5, convertToAsciiSum } from "../utils/codec-util.js";
+import { printFirst200Chars, titleMatches, getExplicitSeasonNumber, extractSeasonNumberFromAnimeTitle } from "../utils/common-util.js";
+import { md5, convertToAsciiSum, decodeHtmlEntities } from "../utils/codec-util.js";
 import { generateValidStartDate } from "../utils/time-util.js";
 import { addAnime, removeEarliestAnime } from "../utils/cache-util.js";
 import { globals } from '../configs/globals.js';
+import { SegmentListResponse } from '../models/dandan-model.js';
 
 // =====================
 // 获取爱奇艺弹幕
@@ -147,8 +148,29 @@ export default class IqiyiSource extends BaseSource {
       return null;
     }
 
+    // 提取 3D 与 2D 属性标签并追加至媒体类型
+    let is3D = false;
+    let is2D = false;
+    if (album.metaTags && Array.isArray(album.metaTags)) {
+        album.metaTags.forEach(tag => {
+            if (tag.name === '3D') is3D = true;
+            if (tag.name === '2D') is2D = true;
+        });
+    }
+    if (album.baseTags && Array.isArray(album.baseTags)) {
+        album.baseTags.forEach(tag => {
+            if (tag.value === '3D') is3D = true;
+            if (tag.value === '2D') is2D = true;
+        });
+    }
+    if (is3D) {
+        mediaType = "3D" + mediaType;
+    } else if (is2D) {
+        mediaType = "2D" + mediaType;
+    }
+
     // 电影类型：使用 qipuId 作为 mediaId
-    if (mediaType === "电影") {
+    if (mediaType.includes("电影")) {
       const qipuId = album.qipuId || album.playQipuId;
       if (!qipuId) {
         log("debug", `[iQiyi] 电影缺少 qipuId: ${album.title}`);
@@ -622,13 +644,14 @@ export default class IqiyiSource extends BaseSource {
   }
 
   /**
-   * 处理搜索结果并格式化为 DanDanPlay 格式
-   * @param {Array} sourceAnimes - 搜索结果数组
-   * @param {string} queryTitle - 搜索关键词
-   * @param {Array} curAnimes - 当前动漫列表
-   * @returns {Promise<void>}
+   * 处理搜索结果
+   * @param {Array} sourceAnimes 原始数据
+   * @param {string} queryTitle 关键词
+   * @param {Array} curAnimes 结果池
+   * @param {Map|null} detailStore 详情缓存
+   * @param {number|null} querySeason 目标季度
    */
-  async handleAnimes(sourceAnimes, queryTitle, curAnimes) {
+  async handleAnimes(sourceAnimes, queryTitle, curAnimes, detailStore = null, querySeason = null) {
     const tmpAnimes = [];
 
     // 添加错误处理，确保sourceAnimes是数组
@@ -637,9 +660,26 @@ export default class IqiyiSource extends BaseSource {
       return [];
     }
 
-    const processIqiyiAnimes = await Promise.all(sourceAnimes
-      .filter(s => titleMatches(s.title, queryTitle))
-      .map(async (anime) => {
+    let filteredAnimes = sourceAnimes.filter(s => titleMatches(s.title, queryTitle, querySeason));
+
+    // 提取搜索词中的明确季度信息或使用传入的季度参数
+    const resolvedQuerySeason = querySeason !== null ? querySeason : getExplicitSeasonNumber(queryTitle);
+
+    // 初始列表预过滤机制：若用户指定了季度，优先检查初始结果中是否已包含匹配项
+    if (resolvedQuerySeason !== null) {
+      const seasonFiltered = filteredAnimes.filter(anime => {
+        const s = extractSeasonNumberFromAnimeTitle(anime.title).season;
+        return s === resolvedQuerySeason || (resolvedQuerySeason === 1 && s === null);
+      });
+
+      // 如果已命中目标，减少详情请求量
+      if (seasonFiltered.length > 0) {
+        filteredAnimes = seasonFiltered;
+        log("info", `[iQiyi] 结果已命中目标季(第${resolvedQuerySeason}季)，跳过非目标季相关请求`);
+      }
+    }
+
+    const processIqiyiAnimes = await Promise.all(filteredAnimes.map(async (anime) => {
         try {
           const eps = await this.getEpisodes(anime.mediaId);
 
@@ -650,7 +690,7 @@ export default class IqiyiSource extends BaseSource {
             links.push({
               "name": ep.order.toString(),
               "url": fullUrl,
-              "title": `【iqiyi】 ${ep.title}`
+              "title": `【qiyi】 ${ep.title}`
             });
           }
 
@@ -667,10 +707,11 @@ export default class IqiyiSource extends BaseSource {
               episodeCount: links.length,
               rating: 0,
               isFavorited: true,
+              source: "iqiyi",
             };
 
             tmpAnimes.push(transformedAnime);
-            addAnime({...transformedAnime, links: links});
+            addAnime({...transformedAnime, links: links}, detailStore);
 
             if (globals.animes.length > globals.MAX_ANIMES) {
               removeEarliestAnime();
@@ -689,10 +730,68 @@ export default class IqiyiSource extends BaseSource {
   async getEpisodeDanmu(id) {
     log("info", "开始从本地请求爱奇艺弹幕...", id);
 
+    // 获取页面标题
+    let res;
+    try {
+      res = await httpGet(id, {
+        headers: {
+          "Content-Type": "application/json",
+          "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
+        },
+      });
+    } catch (error) {
+      log("error", "请求页面失败:", error);
+      return [];
+    }
+
+    // 使用正则表达式提取 <title> 标签内容
+    const titleMatch = res.data.match(/<title[^>]*>(.*?)<\/title>/i);
+    const title = titleMatch ? titleMatch[1].split("_")[0] : "未知标题";
+    log("info", `标题: ${title}`);
+
+    // 获取弹幕分段数据
+    const segmentResult = await this.getEpisodeDanmuSegments(id);
+    if (!segmentResult || !segmentResult.segmentList || segmentResult.segmentList.length === 0) {
+      return [];
+    }
+
+    const segmentList = segmentResult.segmentList;
+    log("info", `弹幕分段数量: ${segmentList.length}`);
+
+    // 创建请求Promise数组
+    const promises = [];
+    for (const segment of segmentList) {
+      promises.push(this.getEpisodeSegmentDanmu(segment));
+    }
+
+    // 解析弹幕数据
+    let contents = [];
+    try {
+      const results = await Promise.allSettled(promises);
+      const datas = results
+        .filter(result => result.status === "fulfilled")
+        .map(result => result.value)
+        .filter(data => data !== null); // 过滤掉null值
+
+      datas.forEach(data => {
+        contents.push(...data);
+      });
+    } catch (error) {
+      log("error", "解析弹幕数据失败:", error);
+      return [];
+    }
+
+    printFirst200Chars(contents);
+
+    return contents;
+  }
+
+  async getEpisodeDanmuSegments(id) {
+    log("info", "获取爱奇艺视频弹幕分段列表...", id);
+
     // 弹幕 API 基础地址
     const api_decode_base = "https://pcw-api.iq.com/api/decode/";
     const api_video_info = "https://pcw-api.iqiyi.com/video/video/baseinfo/";
-    const api_danmaku_base = "https://cmts.iqiyi.com/bullet/";
 
     // 解析 URL 获取 tvid
     let tvid;
@@ -700,7 +799,10 @@ export default class IqiyiSource extends BaseSource {
       const idMatch = id.match(/v_(\w+)/);
       if (!idMatch) {
         log("error", "无法从 URL 中提取 tvid");
-        return [];
+        return new SegmentListResponse({
+          "type": "qiyi",
+          "segmentList": []
+        });
       }
       tvid = idMatch[1];
       log("info", `tvid: ${tvid}`);
@@ -718,11 +820,14 @@ export default class IqiyiSource extends BaseSource {
       log("info", `解码后 tvid: ${tvid}`);
     } catch (error) {
       log("error", "请求解码信息失败:", error);
-      return [];
+      return new SegmentListResponse({
+        "type": "qiyi",
+        "segmentList": []
+      });
     }
 
     // 获取视频基础信息
-    let title, duration, albumid, categoryid;
+    let duration;
     try {
       const videoInfoUrl = `${api_video_info}${tvid}`;
       const res = await httpGet(videoInfoUrl, {
@@ -733,82 +838,223 @@ export default class IqiyiSource extends BaseSource {
       });
       const data = typeof res.data === "string" ? JSON.parse(res.data) : res.data;
       const videoInfo = data.data;
-      title = videoInfo.name || videoInfo.tvName || "未知标题";
-      duration = videoInfo.durationSec;
-      albumid = videoInfo.albumId;
-      categoryid = videoInfo.channelId || videoInfo.categoryId;
-      log("info", `标题: ${title}, 时长: ${duration}`);
+      duration = Number(videoInfo.durationSec) || 0;
+      if (videoInfo.displayBarrage === false) {
+        log("info", "爱奇艺视频未开启弹幕");
+        return new SegmentListResponse({
+          "type": "qiyi",
+          "duration": duration,
+          "segmentList": []
+        });
+      }
+      log("info", `时长: ${duration}`);
     } catch (error) {
       log("error", "请求视频基础信息失败:", error);
-      return [];
+      return new SegmentListResponse({
+        "type": "qiyi",
+        "segmentList": []
+      });
     }
 
-    // 计算弹幕分段数量（每5分钟一个分段）
-    const page = Math.ceil(duration / (60 * 5));
+    // 当前爱奇艺弹幕分片按 60 秒切片，并使用 md5 后缀校验。
+    const segmentDuration = 60;
+    const page = Math.ceil(duration / segmentDuration);
     log("info", `弹幕分段数量: ${page}`);
 
-    // 构建弹幕请求
-    const promises = [];
+    // 构建分段列表
+    const segmentList = [];
+    const paddedTvid = `0000${tvid}`;
+    const bulletPath = `${paddedTvid.slice(-4, -2)}/${paddedTvid.slice(-2)}`;
     for (let i = 0; i < page; i++) {
-      const params = {
-          rn: "0.0123456789123456",
-          business: "danmu",
-          is_iqiyi: "true",
-          is_video_page: "true",
-          tvid: tvid,
-          albumid: albumid,
-          categoryid: categoryid,
-          qypid: "01010021010000000000",
-      };
-      let queryParams = buildQueryString(params);
-      const api_url = `${api_danmaku_base}${tvid.slice(-4, -2)}/${tvid.slice(-2)}/${tvid}_300_${i + 1}.z?${queryParams.toString()}`;
-      promises.push(
-          httpGet(api_url, {
-            headers: {
-              "Accpet-Encoding": "gzip",
-              "Content-Type": "application/xml",
-              "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
-            },
-            zlibMode: true
-          })
-      );
-    }
-
-    // 提取 XML 标签内容的辅助函数
-    function extract(xml, tag) {
-        const reg = new RegExp(`<${tag}>(.*?)</${tag}>`, "g");
-        const res = xml.match(reg)?.map((x) => x.substring(tag.length + 2, x.length - tag.length - 3));
-        return res || [];
-    }
-
-    // 解析弹幕数据
-    let contents = [];
-    try {
-      const results = await Promise.allSettled(promises);
-      const datas = results
-          .filter((result) => result.status === "fulfilled")
-          .map((result) => result.value);
-
-      datas.forEach(data => {
-        const xml = data.data;
-        const danmaku = extract(xml, "content");
-        const showTime = extract(xml, "showTime");
-        const color = extract(xml, "color");
-
-        contents.push(...danmaku.map((content, i) => ({
-          content,
-          showTime: showTime[i],
-          color: color[i],
-        })));
+      const pageNo = i + 1;
+      const sign = md5(`${tvid}_${segmentDuration}_${pageNo}cbzuw1259a`).slice(-8);
+      const api_url = `https://cmts.iqiyi.com/bullet/${bulletPath}/${tvid}_${segmentDuration}_${pageNo}_${sign}.br`;
+      segmentList.push({
+        "type": "qiyi",
+        "segment_start": i * segmentDuration,
+        "segment_end": Math.min((i + 1) * segmentDuration, duration),
+        "url": api_url
       });
-    } catch (error) {
-        log("error", "解析弹幕数据失败:", error);
-        return [];
     }
 
-    printFirst200Chars(contents);
+    return new SegmentListResponse({
+      "type": "qiyi",
+      "duration": duration,
+      "segmentList": segmentList
+    });
+  }
+
+  async getEpisodeSegmentDanmu(segment) {
+    try {
+      const response = await httpGet(segment.url, {
+        headers: {
+          "Accept-Encoding": "br",
+          "Content-Type": "application/octet-stream",
+          "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
+        },
+        base64Data: true,
+        validStatusCodes: [404],
+        retries: 1,
+      });
+
+      if (!response || response.status === 404 || !response.data) {
+        return [];
+      }
+
+      const compressed = this._base64ToUint8Array(response.data);
+      const payload = await this._decompressBrotli(compressed);
+
+      if (payload[0] === 60) {
+        return this._parseIqiyiXmlDanmu(new TextDecoder("utf-8").decode(payload));
+      }
+
+      return this._parseIqiyiProtoDanmu(payload);
+    } catch (error) {
+      log("error", "请求分片弹幕失败:", error);
+      return []; // 返回空数组而不是抛出错误，保持与getEpisodeDanmu一致的行为
+    }
+  }
+
+  _base64ToUint8Array(base64) {
+    if (typeof atob === "function") {
+      const binary = atob(base64);
+      const bytes = new Uint8Array(binary.length);
+      for (let i = 0; i < binary.length; i++) {
+        bytes[i] = binary.charCodeAt(i);
+      }
+      return bytes;
+    }
+
+    if (typeof Buffer !== "undefined") {
+      return new Uint8Array(Buffer.from(base64, "base64"));
+    }
+
+    throw new Error("当前环境不支持 base64 解码");
+  }
+
+  async _decompressBrotli(bytes) {
+    if (typeof DecompressionStream !== "undefined") {
+      try {
+        const stream = new Blob([bytes]).stream().pipeThrough(new DecompressionStream("brotli"));
+        return new Uint8Array(await new Response(stream).arrayBuffer());
+      } catch {
+        log("info", "DecompressionStream Brotli 解压失败，尝试 Node zlib");
+      }
+    }
+
+    const { brotliDecompressSync } = await import("node:zlib");
+    return new Uint8Array(brotliDecompressSync(bytes));
+  }
+
+  _parseIqiyiXmlDanmu(xml) {
+    function extract(tag) {
+      const reg = new RegExp(`<${tag}>(.*?)</${tag}>`, "g");
+      return xml.match(reg)?.map((x) => x.substring(tag.length + 2, x.length - tag.length - 3)) || [];
+    }
+
+    const danmaku = extract("content");
+    const showTime = extract("showTime");
+    const color = extract("color");
+    const like = extract("likeCount");
+
+    return danmaku.map((content, i) => ({
+      content,
+      showTime: showTime[i],
+      color: color[i],
+      like: parseInt(like[i], 10) || 0,
+    }));
+  }
+
+  _parseIqiyiProtoDanmu(bytes) {
+    const contents = [];
+    const fields = this._parseIqiyiProtoFields(bytes);
+
+    for (const field of fields) {
+      if (field.number !== 6 || !field.bytes) continue;
+
+      const danmuBlock = this._parseIqiyiProtoFields(field.bytes);
+      const blockShowTime = this._getIqiyiProtoString(danmuBlock, 1);
+
+      for (const itemField of danmuBlock) {
+        if (itemField.number !== 2 || !itemField.bytes) continue;
+
+        const item = this._parseIqiyiProtoFields(itemField.bytes);
+        const content = this._getIqiyiProtoString(item, 2);
+        if (!content) continue;
+
+        contents.push({
+          content,
+          showTime: this._getIqiyiProtoString(item, 6) || blockShowTime || "0",
+          color: this._getIqiyiProtoString(item, 8) || "ffffff",
+          like: parseInt(this._getIqiyiProtoString(item, 14), 10) || 0,
+        });
+      }
+    }
 
     return contents;
+  }
+
+  _parseIqiyiProtoFields(bytes) {
+    const fields = [];
+    let offset = 0;
+    const decoder = new TextDecoder("utf-8");
+
+    while (offset < bytes.length) {
+      const keyResult = this._readIqiyiVarint(bytes, offset);
+      const key = keyResult.value;
+      offset = keyResult.offset;
+
+      const number = Number(key >> 3n);
+      const wireType = Number(key & 7n);
+      if (number === 0) break;
+
+      if (wireType === 0) {
+        const valueResult = this._readIqiyiVarint(bytes, offset);
+        fields.push({ number, wireType, value: valueResult.value.toString() });
+        offset = valueResult.offset;
+      } else if (wireType === 1) {
+        fields.push({ number, wireType });
+        offset += 8;
+      } else if (wireType === 2) {
+        const lengthResult = this._readIqiyiVarint(bytes, offset);
+        const length = Number(lengthResult.value);
+        offset = lengthResult.offset;
+        const end = offset + length;
+        if (end > bytes.length) break;
+
+        const raw = bytes.subarray(offset, end);
+        fields.push({ number, wireType, bytes: raw, value: decoder.decode(raw) });
+        offset = end;
+      } else if (wireType === 5) {
+        fields.push({ number, wireType });
+        offset += 4;
+      } else {
+        break;
+      }
+    }
+
+    return fields;
+  }
+
+  _readIqiyiVarint(bytes, offset) {
+    let value = 0n;
+    let shift = 0n;
+    let pos = offset;
+
+    while (pos < bytes.length) {
+      const byte = bytes[pos++];
+      value |= BigInt(byte & 0x7f) << shift;
+      if ((byte & 0x80) === 0) {
+        return { value, offset: pos };
+      }
+      shift += 7n;
+    }
+
+    throw new Error("爱奇艺弹幕 protobuf varint 不完整");
+  }
+
+  _getIqiyiProtoString(fields, number) {
+    return fields.find(field => field.number === number)?.value || "";
   }
 
   formatComments(comments) {
@@ -824,8 +1070,9 @@ export default class IqiyiSource extends BaseSource {
       };
       content.timepoint = parseFloat(item["showTime"]);
       content.color = parseInt(item["color"], 16);
-      content.content = item["content"];
+      content.content = decodeHtmlEntities(item["content"]);
       content.size = 25;
+      content.like = item["like"];
       return content;
     });
   }

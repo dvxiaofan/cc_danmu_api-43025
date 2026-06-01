@@ -2,10 +2,11 @@ import BaseSource from './base.js';
 import { globals } from '../configs/globals.js';
 import { log } from "../utils/log-util.js";
 import { buildQueryString, httpGet, httpPost } from "../utils/http-util.js";
-import { printFirst200Chars, titleMatches } from "../utils/common-util.js";
+import { printFirst200Chars, titleMatches, getExplicitSeasonNumber, extractSeasonNumberFromAnimeTitle } from "../utils/common-util.js";
 import { md5, convertToAsciiSum } from "../utils/codec-util.js";
 import { generateValidStartDate } from "../utils/time-util.js";
 import { addAnime, removeEarliestAnime } from "../utils/cache-util.js";
+import { SegmentListResponse } from '../models/dandan-model.js';
 
 // =====================
 // 获取优酷弹幕
@@ -204,7 +205,15 @@ export default class YoukuSource extends BaseSource {
     return data;
   }
 
-  async handleAnimes(sourceAnimes, queryTitle, curAnimes) {
+  /**
+   * 处理搜索结果
+   * @param {Array} sourceAnimes 原始数据
+   * @param {string} queryTitle 关键词
+   * @param {Array} curAnimes 结果池
+   * @param {Map|null} detailStore 详情缓存
+   * @param {number|null} querySeason 目标季度
+   */
+  async handleAnimes(sourceAnimes, queryTitle, curAnimes, detailStore = null, querySeason = null) {
     const tmpAnimes = [];
 
     // 添加错误处理，确保sourceAnimes是数组
@@ -213,9 +222,27 @@ export default class YoukuSource extends BaseSource {
       return [];
     }
 
-    const processYoukuAnimes = await Promise.all(sourceAnimes
-      .filter(s => titleMatches(s.title, queryTitle))
-      .map(async (anime) => {
+    // 基础标题与季度匹配过滤
+    let filteredAnimes = sourceAnimes.filter(s => titleMatches(s.title, queryTitle, querySeason));
+
+    // 提取搜索词中的明确季度信息或使用传入的季度参数
+    const resolvedQuerySeason = querySeason !== null ? querySeason : getExplicitSeasonNumber(queryTitle);
+
+    // 初始列表预过滤机制：若用户指定了季度，优先检查结果中是否已包含匹配项
+    if (resolvedQuerySeason !== null) {
+      const seasonFiltered = filteredAnimes.filter(anime => {
+        const s = extractSeasonNumberFromAnimeTitle(anime.title).season;
+        return s === resolvedQuerySeason || (resolvedQuerySeason === 1 && s === null);
+      });
+
+      // 如果已命中目标，减少详情请求量
+      if (seasonFiltered.length > 0) {
+        filteredAnimes = seasonFiltered;
+        log("info", `[Youku] 结果已命中目标季(第${resolvedQuerySeason}季)，跳过非目标季相关请求`);
+      }
+    }
+
+    const processYoukuAnimes = await Promise.all(filteredAnimes.map(async (anime) => {
         try {
           const eps = await this.getEpisodes(anime.mediaId);
 
@@ -248,10 +275,11 @@ export default class YoukuSource extends BaseSource {
               episodeCount: links.length,
               rating: 0,
               isFavorited: true,
+              source: "youku",
             };
 
             tmpAnimes.push(transformedAnime);
-            addAnime({...transformedAnime, links: links});
+            addAnime({...transformedAnime, links: links}, detailStore);
 
             if (globals.animes.length > globals.MAX_ANIMES) removeEarliestAnime();
           }
@@ -273,35 +301,6 @@ export default class YoukuSource extends BaseSource {
    */
   _processAndFormatEpisodes(rawEpisodes, mediaType = 'variety') {
     let filteredEpisodes = [...rawEpisodes];
-
-    // 综艺节目需要倒序处理
-    if (mediaType === 'variety') {
-      log("info", `[Youku] 检测到综艺节目，进行倒序处理`);
-      filteredEpisodes = filteredEpisodes.reverse();
-
-      // 检测特殊格式 "第N期：上/中/下"
-      const specialFormatPattern = /第\d+期\s*[：:]\s*[上中下]\s*[：:]/;
-      const hasSpecialFormat = filteredEpisodes.some(ep => {
-        const displayName = ep.displayName || ep.title;
-        return specialFormatPattern.test(displayName);
-      });
-
-      if (hasSpecialFormat) {
-        log("info", `[Youku] 检测到综艺特殊格式 '第N期：上/中/下'，进行智能过滤`);
-        // 只保留"上"或没有标记的分集
-        const finalFiltered = [];
-        for (const ep of filteredEpisodes) {
-          const displayName = ep.displayName || ep.title;
-          const match = displayName.match(/第(\d+)期\s*[：:]\s*([上中下])/);
-          if (!match || match[2] === '上') {
-            finalFiltered.push(ep);
-          } else {
-            log("debug", `[Youku] 过滤掉综艺分段: ${displayName}`);
-          }
-        }
-        filteredEpisodes = finalFiltered;
-      }
-    }
 
     // 格式化分集标题
     const formattedEpisodes = filteredEpisodes.map((ep, index) => {
@@ -341,9 +340,9 @@ export default class YoukuSource extends BaseSource {
     if (mediaType === 'variety') {
       const periodMatch = cleanDisplayName.match(/第(\d+)期/);
       if (periodMatch) {
-        return `第${periodMatch[1]}期`;
+        return `第${periodMatch[1]}期 ${ep.published?.split(' ')[0] ?? ''} ${cleanDisplayName}`;
       } else {
-        return `第${episodeIndex}期`;
+        return `第${episodeIndex}期 ${ep.published?.split(' ')[0] ?? ''} ${cleanDisplayName}`;
       }
     }
 
@@ -391,11 +390,71 @@ export default class YoukuSource extends BaseSource {
     return 'drama';
   }
 
-  async getEpisodeDanmu(id) {
+   async getEpisodeDanmu(id) {
     log("info", "开始从本地请求优酷弹幕...", id);
 
     if (!id) {
       return [];
+    }
+
+    // 获取分片URL列表
+    const segmentListResponse = await this.getEpisodeDanmuSegments(id);
+    const segmentList = segmentListResponse.segmentList;
+
+    let contents = [];
+
+    // 并发限制（可通过环境变量 YOUKU_CONCURRENCY 配置，默认 8）
+    const concurrency = globals.youkuConcurrency;
+    const segments = [...segmentList];
+
+    for (let i = 0; i < segments.length; i += concurrency) {
+      const batch = segments.slice(i, i + concurrency).map(async (segment) => {
+        const response = await httpPost(segment.url, buildQueryString({ data: segment.data }), {
+          headers: {
+            "Cookie": `_m_h5_tk=${segment._m_h5_tk};_m_h5_tk_enc=${segment._m_h5_tk_enc};`,
+            "Referer": "https://v.youku.com",
+            "Content-Type": "application/x-www-form-urlencoded",
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/79.0.3945.88 Safari/537.36",
+          },
+          allow_redirects: false,
+          retries: 1,
+        });
+
+        const results = [];
+        if (response.data?.data && response.data.data.result) {
+          const result = JSON.parse(response.data.data.result);
+          if (result.code !== "-1") {
+            results.push(...result.data.result);
+          }
+        }
+        return results;
+      });
+
+      try {
+        const settled = await Promise.allSettled(batch);
+        for (const s of settled) {
+          if (s.status === "fulfilled" && Array.isArray(s.value)) {
+            contents = contents.concat(s.value);
+          }
+        }
+      } catch (e) {
+        log("error", "优酷分段批量请求失败:", e.message);
+      }
+    }
+
+    printFirst200Chars(contents);
+
+    return contents;
+  }
+
+  async getEpisodeDanmuSegments(id) {
+    log("info", "获取优酷弹幕分段列表...", id);
+
+    if (!id) {
+      return new SegmentListResponse({
+        "type": "youku",
+        "segmentList": []
+      });
     }
 
     // 处理302场景
@@ -500,7 +559,7 @@ export default class YoukuSource extends BaseSource {
     // 计算弹幕分段请求
     const step = 60; // 每60秒一个分段
     const max_mat = Math.floor(duration / step) + 1;
-    let contents = [];
+    let segmentList = [];
 
     // 将构造请求和解析逻辑封装为函数，返回该分段的弹幕数组
     const requestOneMat = async (mat) => {
@@ -577,46 +636,52 @@ export default class YoukuSource extends BaseSource {
       const url = `${api_danmaku}?${queryString}`;
       log("info", `piece_url: ${url}`);
 
-      const response = await httpPost(url, buildQueryString({ data: data }), {
-        headers: {
-          "Cookie": `_m_h5_tk=${_m_h5_tk};_m_h5_tk_enc=${_m_h5_tk_enc};`,
-          "Referer": "https://v.youku.com",
-          "Content-Type": "application/x-www-form-urlencoded",
-          "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/79.0.3945.88 Safari/537.36",
-        },
-        allow_redirects: false
-      });
+      return {
+        "type": "youku",
+        "segment_start": mat * step,
+        "segment_end": Math.min((mat + 1) * step, duration),
+        "url": url,
+        "data": data,
+        "_m_h5_tk": _m_h5_tk,
+        "_m_h5_tk_enc": _m_h5_tk_enc,
+      };
+    }
 
-      const results = [];
-      if (response.data?.data && response.data.data.result) {
-        const result = JSON.parse(response.data.data.result);
-        if (result.code !== "-1") {
-          results.push(...result.data.result);
-        }
-      }
-      return results;
-    };
-
-    // 并发限制（可通过环境变量 YOUKU_CONCURRENCY 配置，默认 8）
-    const concurrency = globals.youkuConcurrency;
     const mats = Array.from({ length: max_mat }, (_, i) => i);
-    for (let i = 0; i < mats.length; i += concurrency) {
-      const batch = mats.slice(i, i + concurrency).map((m) => requestOneMat(m));
-      try {
-        const settled = await Promise.allSettled(batch);
-        for (const s of settled) {
-          if (s.status === "fulfilled" && Array.isArray(s.value)) {
-            contents = contents.concat(s.value);
-          }
-        }
-      } catch (e) {
-        log("error", "优酷分段批量请求失败:", e.message);
+    for (let i = 0; i < mats.length; i++) {
+      const result = await requestOneMat(mats[i]);
+      segmentList.push(result);
+    }
+
+    return new SegmentListResponse({
+      "type": "youku",
+      "segmentList": segmentList
+    });
+  }
+
+  async getEpisodeSegmentDanmu(segment) {
+    log("info", "开始从本地请求优酷分段弹幕...", segment.url);
+
+    const response = await httpPost(segment.url, buildQueryString({ data: segment.data }), {
+      headers: {
+        "Cookie": `_m_h5_tk=${segment._m_h5_tk};_m_h5_tk_enc=${segment._m_h5_tk_enc};`,
+        "Referer": "https://v.youku.com",
+        "Content-Type": "application/x-www-form-urlencoded",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/79.0.3945.88 Safari/537.36",
+      },
+      allow_redirects: false,
+      retries: 1,
+    });
+
+    const results = [];
+    if (response.data?.data && response.data.data.result) {
+      const result = JSON.parse(response.data.data.result);
+      if (result.code !== "-1") {
+        results.push(...result.data.result);
       }
     }
 
-    printFirst200Chars(contents);
-
-    return contents;
+    return results;
   }
 
   formatComments(comments) {
@@ -633,7 +698,9 @@ export default class YoukuSource extends BaseSource {
       content.timepoint = item.playat / 1000;
       const prop = JSON.parse(item.propertis)
       if (prop?.color) {
-        content.color = prop.color;
+        content.color = typeof prop.color === 'string' 
+          ? parseInt(prop.color, 10) 
+          : prop.color;
       }
       if (prop?.pos) {
         const pos = prop.pos;
@@ -641,6 +708,7 @@ export default class YoukuSource extends BaseSource {
         else if (pos === 2) content.ct = 4;
       }
       content.content = item.content;
+      content.like = item.extFields.voteUp;
       return content;
     });
   }

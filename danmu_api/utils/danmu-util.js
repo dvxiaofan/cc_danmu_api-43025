@@ -1,14 +1,23 @@
 import { globals } from '../configs/globals.js';
 import { log } from './log-util.js'
 import { jsonResponse, xmlResponse } from "./http-util.js";
+import { traditionalized } from './zh-util.js';
 
 // =====================
 // danmu处理相关函数
 // =====================
 
-export function groupDanmusByMinute(filteredDanmus, n) {
-  // 如果 n 为 0，直接返回原始数据
-  if (n === 0) {
+/**
+ * 对弹幕进行分组、去重和计数处理
+ * @param {Array} filteredDanmus 已过滤屏蔽词的弹幕列表
+ * @param {number} n 分组时间间隔（分钟），0表示不分组（除非多源合并强制去重）
+ * @param {boolean} isMultiSource 是否为多源弹幕
+ * @returns {Array} 处理后的弹幕列表
+ */
+export function groupDanmusByMinute(filteredDanmus, n, isMultiSource = false) {
+  // 特殊逻辑：如果未开启分组(n=0)且为单源，直接返回原始数据
+  // 若为多源，即使n=0也强制执行精确时间点去重，以消除源之间的重复数据
+  if (n === 0 && !isMultiSource) {
     return filteredDanmus.map(danmu => ({
       ...danmu,
       t: danmu.t !== undefined ? danmu.t : parseFloat(danmu.p.split(',')[0])
@@ -16,51 +25,79 @@ export function groupDanmusByMinute(filteredDanmus, n) {
   }
 
   // 按 n 分钟分组
-  const groupedByMinute = filteredDanmus.reduce((acc, danmu) => {
+  const groupedByTime = filteredDanmus.reduce((acc, danmu) => {
     // 获取时间：优先使用 t 字段，如果没有则使用 p 的第一个值
     const time = danmu.t !== undefined ? danmu.t : parseFloat(danmu.p.split(',')[0]);
-    // 计算分组（每 n 分钟一组，向下取整）
-    const group = Math.floor(time / (n * 60));
+    
+    // 确定分组键：n=0时使用精确时间(保留2位小数)，否则使用分钟索引
+    const groupKey = n === 0 ? time.toFixed(2) : Math.floor(time / (n * 60));
 
     // 初始化分组
-    if (!acc[group]) {
-      acc[group] = [];
+    if (!acc[groupKey]) {
+      acc[groupKey] = [];
     }
 
     // 添加到对应分组
-    acc[group].push({ ...danmu, t: time });
+    acc[groupKey].push({ ...danmu, t: time });
     return acc;
   }, {});
 
   // 处理每组的弹幕
-  const result = Object.keys(groupedByMinute).map(group => {
-    const danmus = groupedByMinute[group];
+  const result = Object.keys(groupedByTime).map(key => {
+    const danmus = groupedByTime[key];
 
     // 按消息内容分组
     const groupedByMessage = danmus.reduce((acc, danmu) => {
-      const message = danmu.m.split(' X')[0]; // 提取原始消息（去除 Xn 后缀）
+      const message = danmu.m.split(' X')[0].trim(); // 提取原始消息（去除 Xn 后缀）
       if (!acc[message]) {
         acc[message] = {
           count: 0,
           earliestT: danmu.t,
           cid: danmu.cid,
-          p: danmu.p
+          p: danmu.p,
+          like: 0,  // 初始化like字段
+          sources: new Set() // 收集当前具体弹幕内容的真实独立来源
         };
       }
       acc[message].count += 1;
       // 更新最早时间
       acc[message].earliestT = Math.min(acc[message].earliestT, danmu.t);
+      // 合并like字段，如果是undefined则视为0
+      acc[message].like += (danmu.like !== undefined ? danmu.like : 0);
+      
+      // 提取当前弹幕的来源并加入集合中，建立弹幕内容与平台的精确映射
+      if (danmu.p) {
+        const match = danmu.p.match(/\[([^\]]*)\]$/);
+        if (match && match[1]) {
+            match[1].split(/[&＆]/).forEach(s => {
+                if (s.trim()) acc[message].sources.add(s.trim());
+            });
+        }
+      }
       return acc;
     }, {});
 
     // 转换为结果格式
     return Object.keys(groupedByMessage).map(message => {
       const data = groupedByMessage[message];
+      
+      // 以当前这句弹幕实际跨越的独立平台数作为除数，进行局部精准降噪，保留单平台内真实的重复计数
+      let localSourceCount = Math.max(1, data.sources.size);
+      let displayCount = Math.round(data.count / localSourceCount);
+      
+      if (displayCount < 1) displayCount = 1;
+
+      // 将收集到的所有真实独立来源重新拼装回 p 属性标签中
+      const combinedSources = Array.from(data.sources).join('＆');
+      const newP = data.p.replace(/\[([^\]]*)\]$/, `[${combinedSources}]`);
+
       return {
         cid: data.cid,
-        p: data.p,
-        m: data.count > 1 ? `${message} x ${data.count}` : message,
-        t: data.earliestT
+        p: newP,
+        // 仅当计算后的逻辑计数大于1时才显示 "x N"
+        m: displayCount > 1 ? `${message}\u200Ax\u200A${displayCount}` : message,
+        t: data.earliestT,
+        like: data.like // 包含合并后的like字段
       };
     });
   });
@@ -69,9 +106,95 @@ export function groupDanmusByMinute(filteredDanmus, n) {
   return result.flat().sort((a, b) => a.t - b.t);
 }
 
+/**
+ * 处理弹幕的点赞数显示
+ * @param {Array} groupedDanmus 弹幕列表
+ * @returns {Array} 处理后的弹幕列表
+ */
+export function handleDanmusLike(groupedDanmus) {
+  if (!globals.likeSwitch) {
+    return groupedDanmus;
+  }
+  const lowThresholdSources = new Set([
+    '[hanjutv]',
+    '[sohu]',
+    '[bilibili1]',
+    '[migu]',
+  ]);
+  return groupedDanmus.map(item => {
+    // 如果item没有like字段或者like值小于5，则不处理
+    if (!item.like || item.like < 5) {
+      return item;
+    }
+
+    // 韩剧TV 双链路标签可能继续扩展，按来源标签内容判断更稳。
+    const sourceTag = item.p.match(/,(\[[^\]]+\])$/)?.[1] || '';
+    const isHanjutvVariantTag = sourceTag.includes('韩小圈') || sourceTag.includes('极速版');
+    const isLowThresholdSource = isHanjutvVariantTag || lowThresholdSources.has(sourceTag);
+
+    // 确定阈值：特定源中>=100用🔥，其他>=1000用🔥
+    const threshold = isLowThresholdSource ? 100 : 1000;
+    const icon = item.like >= threshold ? '🔥' : '️♡';
+
+    // 格式化点赞数，缩写显示
+    let formattedLike;
+    if (item.like >= 10000) {
+      // 万级别，如 1.2w
+      formattedLike = (item.like / 10000).toFixed(1) + 'w';
+    } else if (item.like >= 1000) {
+      // 千级别，如 1.2k
+      formattedLike = (item.like / 1000).toFixed(1) + 'k';
+    } else {
+      // 百级别及以下，直接显示数字
+      formattedLike = item.like.toString();
+    }
+
+    // 在弹幕内容m字段后面添加点赞信息
+    const likeText = `\u200A${icon}${formattedLike}`;
+    const newM = item.m + likeText;
+
+    // 创建新对象，复制原属性，更新m字段，并删除like字段
+    const { like, ...rest } = item;
+    return {
+      ...rest,
+      m: newM
+    };
+  });
+}
+
+export function limitDanmusByCount(filteredDanmus, danmuLimit) {
+  // 如果 danmuLimit 为 0，直接返回原始数据
+  if (danmuLimit === 0) {
+    return filteredDanmus;
+  }
+
+  // 计算目标弹幕数量
+  const targetCount = danmuLimit * 1000;
+  const totalCount = filteredDanmus.length;
+
+  // 如果当前弹幕数不超过目标数量，直接返回
+  if (totalCount <= targetCount) {
+    return filteredDanmus;
+  }
+
+  // 计算采样间隔
+  const interval = totalCount / targetCount;
+
+  // 按间隔抽取弹幕
+  const result = [];
+  for (let i = 0; i < targetCount; i++) {
+    // 计算当前应该取的索引位置
+    const index = Math.floor(i * interval);
+    result.push(filteredDanmus[index]);
+  }
+
+  return result;
+}
+
 export function convertToDanmakuJson(contents, platform) {
   let danmus = [];
   let cidCounter = 1;
+  let isMultiSource = false; // 用于记录当前弹幕集合是否为多源组合
 
   // 统一处理输入为数组
   let items = [];
@@ -145,14 +268,27 @@ export function convertToDanmakuJson(contents, platform) {
       m = item.m;
     }
 
+    // 优先使用弹幕自带的 _sourceLabel（应对合并工具），其次是外部传入的宏观 platform
+    let currentPlatform = item._sourceLabel || platform;
+    
+    // 如果存在实时拉取的副源标签，安全追加
+    if (item.realTimeSource && !currentPlatform.includes(item.realTimeSource)) {
+        currentPlatform = `${currentPlatform}＆${item.realTimeSource}`;
+    }
+
+    // 在组装字符串时，顺带通过符号检测判定当前是否为多源组合数据
+    if (!isMultiSource && /[&＆]/.test(currentPlatform)) {
+        isMultiSource = true;
+    }
+
     attributes = [
       time,
       mode,
       color,
-      `[${platform}]`
+      `[${currentPlatform}]`
     ].join(",");
 
-    danmus.push({ p: attributes, m, cid: cidCounter++ });
+    danmus.push({ p: attributes, m, cid: cidCounter++, like: item?.like });
   }
 
   // 切割字符串成正则表达式数组
@@ -182,15 +318,18 @@ export function convertToDanmakuJson(contents, platform) {
 
   // 按n分钟内去重
   log("info", `去重分钟数: ${globals.groupMinute}`);
-  const groupedDanmus = groupDanmusByMinute(filteredDanmus, globals.groupMinute);
+  const groupedDanmus = groupDanmusByMinute(filteredDanmus, globals.groupMinute, isMultiSource);
 
-  // 应用弹幕转换规则（在去重之后）
-  let convertedDanmus = groupedDanmus;
-  if (globals.convertTopBottomToScroll || globals.convertColorToWhite) {
+  // 处理点赞数
+  const likeDanmus = handleDanmusLike(groupedDanmus);
+
+  // 应用弹幕转换规则（在去重和限制弹幕数之后）
+  let convertedDanmus = limitDanmusByCount(likeDanmus, globals.danmuLimit);
+  if (globals.convertTopBottomToScroll || globals.convertColor === 'white' || globals.convertColor === 'color') {
     let topBottomCount = 0;
     let colorCount = 0;
 
-    convertedDanmus = groupedDanmus.map(danmu => {
+    convertedDanmus = convertedDanmus.map(danmu => {
       const pValues = danmu.p.split(',');
       if (pValues.length < 3) return danmu;
 
@@ -205,10 +344,19 @@ export function convertToDanmakuJson(contents, platform) {
         modified = true;
       }
 
-      // 2. 将彩色弹幕转换为纯白弹幕
-      if (globals.convertColorToWhite && color !== 16777215) {
+      // 2. 弹幕转换颜色
+      // 2.1 将彩色弹幕转换为白色
+      if (globals.convertColor === 'white' && color !== 16777215) {
         colorCount++;
         color = 16777215;
+        modified = true;
+      }
+      // 2.2 将白色弹幕转换为随机颜色，白、红、橙、黄、绿、青、蓝、紫、粉（模拟真实情况，增加白色出现概率）
+      let colors = globals.colorPool.split(',').map(c => parseInt(c.trim(), 10)).filter(c => !isNaN(c) && c >= 0 && c <= 16777215);
+      let randomColor = colors[Math.floor(Math.random() * colors.length)];
+      if (globals.convertColor === 'color' && color === 16777215 && color !== randomColor) {
+        colorCount++;
+        color = randomColor;
         modified = true;
       }
 
@@ -224,13 +372,23 @@ export function convertToDanmakuJson(contents, platform) {
       log("info", `[danmu convert] 转换了 ${topBottomCount} 条顶部/底部弹幕为浮动弹幕`);
     }
     if (colorCount > 0) {
-      log("info", `[danmu convert] 转换了 ${colorCount} 条彩色弹幕为纯白弹幕`);
+      log("info", `[danmu convert] 转换了 ${colorCount} 条弹幕颜色`);
     }
+  }
+
+  // 根据 danmuSimplifiedTraditional 设置转换弹幕文本
+  if (globals.danmuSimplifiedTraditional === 'traditional') {
+    convertedDanmus = convertedDanmus.map(danmu => ({
+      ...danmu,
+      m: traditionalized(danmu.m)
+    }));
+    log("info", `[danmu convert] 转换了 ${convertedDanmus.length} 条弹幕为繁体字`);
   }
 
   log("info", `danmus_original: ${danmus.length}`);
   log("info", `danmus_filter: ${filteredDanmus.length}`);
   log("info", `danmus_group: ${groupedDanmus.length}`);
+  log("info", `danmus_limit: ${convertedDanmus.length}`);
   // 输出前五条弹幕
   log("info", "Top 5 danmus:", JSON.stringify(convertedDanmus.slice(0, 5), null, 2));
   return convertedDanmus;
@@ -247,6 +405,15 @@ export function rgbToInt(color) {
     return -1;
   }
   return color.r * 256 * 256 + color.g * 256 + color.b;
+}
+
+// 解析 hex 到 int（假设不带 #）
+export function hexToInt(hex) {
+  // 简单校验：确保是 6 位 hex 字符串（不带 #）
+  if (typeof hex !== 'string' || hex.length !== 6 || !/^[0-9A-Fa-f]{6}$/.test(hex)) {
+    return 16777215;  // 无效输入，返回 16777215 白色
+  }
+  return parseInt(hex, 16);  // 直接转换为整数
 }
 
 // 将弹幕 JSON 数据转换为 XML 格式（Bilibili 标准格式）

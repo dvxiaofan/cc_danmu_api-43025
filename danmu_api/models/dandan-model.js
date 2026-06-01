@@ -6,7 +6,8 @@ import { validateType } from "../utils/common-util.js";
 export class Anime {
   constructor({ animeId = 111, bangumiId = "", animeTitle = "", type = "",
                 typeDescription = "", imageUrl = "", startDate = "", episodeCount = 1,
-                rating = 0, isFavorited = true, links = [] } = {}) {
+                rating = 0, isFavorited = true, source = "", links = [],
+                mergedChildren = [], isHiddenChild = false } = {}) {
     // ---- 类型检查 ----
     validateType(animeId, "number");
     validateType(bangumiId, "string");
@@ -18,14 +19,17 @@ export class Anime {
     validateType(episodeCount, "number");
     validateType(rating, "number");
     validateType(isFavorited, "boolean");
+    validateType(source, "string");
     validateType(links, "array");
+    validateType(mergedChildren, "array");
+    validateType(isHiddenChild, "boolean");
 
     // 将 links 转换为 Link 实例数组
     this.links = links.map(linkData => Link.fromJson(linkData));
 
     // 直接解构并赋值给 this
     Object.assign(this, { animeId, bangumiId, animeTitle, type, typeDescription, imageUrl, startDate,
-      episodeCount, rating, isFavorited });
+      episodeCount, rating, isFavorited, source, mergedChildren, isHiddenChild  });
   }
 
   // ---- 静态方法：从 JSON 创建 Anime 对象 ----
@@ -34,7 +38,7 @@ export class Anime {
       throw new TypeError("fromJson 参数必须是对象");
     }
 
-    const links = json.links.map(link => Link.fromJson(link));
+    const links = (json.links || []).map(link => Link.fromJson(link));
     return new Anime({ ...json, links });
   }
 
@@ -266,5 +270,74 @@ export class Bangumi {
       seasons: this.seasons.map(season => season.toJson()),  // 转换每个 season 为 JSON
       episodes: this.episodes.map(ep => ep.toJson())  // 转换每个 episode 为 JSON
     };
+  }
+}
+
+// =====================
+// 数据模型：SegmentListResponse
+// =====================
+export class SegmentListResponse {
+  constructor({ type = "", segmentList = [], duration = 0 } = {}) {
+    validateType(type, "string");
+    validateType(segmentList, "array");
+    validateType(duration, "number");
+
+    // 将 segmentList 转换为 Segment 实例数组
+    this.segmentList = segmentList.map(segmentData => Segment.fromJson(segmentData));
+
+    // 直接解构并赋值给 this
+    Object.assign(this, { type, duration });
+  }
+
+  // ---- 静态方法：从 JSON 创建 SegmentListResponse 对象 ----
+  static fromJson(json) {
+    if (typeof json !== "object" || json === null) {
+      throw new TypeError("fromJson 参数必须是对象");
+    }
+
+    const segmentList = (json.segmentList || []).map(segment => Segment.fromJson(segment));
+    return new SegmentListResponse({ ...json, segmentList });
+  }
+
+  // ---- 转换为纯 JSON ----
+  toJson() {
+    return {
+      ...this,
+      segmentList: this.segmentList.map(segment => segment.toJson())
+    };
+  }
+}
+
+// =====================
+// 数据模型：Segment
+// =====================
+export class Segment {
+  constructor({ type, segment_start, segment_end, url, data, _m_h5_tk, _m_h5_tk_enc } = {}) {
+    // 必需字段验证
+    validateType(type, "string", "type");
+    validateType(segment_start, "number", "segment_start");
+    validateType(segment_end, "number", "segment_end");
+    validateType(url, "string", "url");
+
+    // 可选字段验证
+    if (data !== undefined) validateType(data, "string", "data");
+    if (_m_h5_tk !== undefined) validateType(_m_h5_tk, "string", "_m_h5_tk");
+    if (_m_h5_tk_enc !== undefined) validateType(_m_h5_tk_enc, "string", "_m_h5_tk_enc");
+
+    // 直接解构并赋值给 this
+    Object.assign(this, { type, segment_start, segment_end, url, data, _m_h5_tk, _m_h5_tk_enc });
+  }
+
+  // ---- 静态方法：从 JSON 创建 Segment 对象 ----
+  static fromJson(json) {
+    if (typeof json !== "object" || json === null) {
+      throw new TypeError("fromJson 参数必须是对象");
+    }
+    return new Segment(json);
+  }
+
+  // ---- 转换为纯 JSON ----
+  toJson() {
+    return { ...this };
   }
 }
