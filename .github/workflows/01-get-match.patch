@@ -1,3 +1,158 @@
+diff --git a/.github/workflows/99_local_patches.yml b/.github/workflows/99_local_patches.yml
+new file mode 100644
+index 0000000..c23ddf5
+--- /dev/null
++++ b/.github/workflows/99_local_patches.yml
+@@ -0,0 +1,149 @@
++name: Apply Local Patches (post fork sync)
++
++# 本地 patch 维护工具 — fork sync workflow (sync_fork.yml) 跑完后自动重打本仓库的本地修改。
++# 之所以用这种方案:仓库是从 huangxd-/danmu_api 拉来的"伪 fork",上游
++# `git checkout upstream/main -- .` 会把本地改动覆盖掉。这里只把 patch 文件放在
++# .github/workflows/ 下(同步排除目录),sync 完成后自动 apply,Netlify 部署时拿到的是
++# "上游 + 本地 patch" 的合并代码。
++#
++# 失败时自动开一个带 'patch-failed' 标签的 issue 通知仓库所有者。
++# 打开 GitHub app 即可手机端 push 通知。
++
++on:
++  workflow_run:
++    workflows: ["Fork Sync"]
++    types: [completed]
++  workflow_dispatch:
++
++permissions:
++  contents: write
++  issues: write
++
++jobs:
++  apply-patches:
++    name: Apply *.patch files under .github/workflows/
++    runs-on: ubuntu-latest
++    # 注意:这里没用 continue-on-error,让 patch 失败真实地 fail,
++    # 这样下面 if: failure() 的 issue 通知 step 才能触发。
++    steps:
++      - name: Checkout this repo
++        uses: actions/checkout@v4
++        with:
++          fetch-depth: 0
++          token: ${{ secrets.GITHUB_TOKEN }}
++
++      - name: Apply local patches
++        id: apply
++        run: |
++          set -e
++          shopt -s nullglob
++          patches=(.github/workflows/*.patch)
++          if [ ${#patches[@]} -eq 0 ]; then
++            echo "No .patch files found under .github/workflows/, nothing to do."
++            exit 0
++          fi
++
++          failed_patches=""
++          for patch in "${patches[@]}"; do
++            echo "==================================================="
++            echo "Applying: $patch"
++            echo "==================================================="
++
++            # 先 dry-run 检查能否 apply,失败则收集错误信息到 step output
++            if ! git apply --check --3way "$patch" 2> /tmp/apply_err.log; then
++              err_msg=$(cat /tmp/apply_err.log | head -30)
++              failed_patches="${failed_patches}\n\n### ${patch}\n\`\`\`\n${err_msg}\n\`\`\`"
++              echo "::error::Patch $patch cannot be applied cleanly."
++              continue
++            fi
++
++            git apply --3way "$patch"
++            echo "OK: $patch"
++          done
++
++          # 写失败信息到 step output,供 issue 通知 step 使用
++          if [ -n "$failed_patches" ]; then
++            echo "failed_patches<<EOF" >> $GITHUB_OUTPUT
++            echo -e "$failed_patches" >> $GITHUB_OUTPUT
++            echo "EOF" >> $GITHUB_OUTPUT
++            echo "Some patches failed to apply." >> $GITHUB_OUTPUT
++            exit 1
++          fi
++
++      - name: Commit and push
++        run: |
++          if git diff --quiet; then
++            echo "No effective changes from patches, skipping commit."
++            exit 0
++          fi
++          git config user.name "github-actions[bot]"
++          git config user.email "github-actions[bot]@users.noreply.github.com"
++          git add -A
++          git commit -m "chore: apply local patches after fork sync"
++          git push origin main
++          echo "Pushed patched code to main → Netlify will redeploy automatically."
++
++      - name: Open issue on failure
++        if: failure()
++        uses: actions/github-script@v7
++        with:
++          script: |
++            const failed = `${{ steps.apply.outputs.failed_patches }}` || '未知错误';
++            const runUrl = `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
++            const title = '🔧 [patch-failed] 本地 patch apply 失败,需要手动重打';
++
++            // 检查是否已经存在未关闭的 patch-failed issue,避免重复刷
++            const existing = await github.rest.issues.listForRepo({
++              owner: context.repo.owner,
++              repo: context.repo.repo,
++              state: 'open',
++              labels: 'patch-failed',
++            });
++            if (existing.data.length > 0) {
++              core.info(`已有未关闭的 patch-failed issue (#${existing.data[0].number}),跳过新建`);
++              return;
++            }
++
++            const body = [
++              '## 背景',
++              '',
++              '本仓库使用 [Fork Sync workflow](.github/workflows/sync_fork.yml) 自动同步上游 `huangxd-/danmu_api` 的最新代码。',
++              '同步完成后会触发本 workflow 重打本仓库的本地 patch(`GET /api/v2/match` 兼容 senplayer 的改动)。',
++              '',
++              '本次同步后,部分 patch 不能干净 apply,需要手动重打。',
++              '',
++              '## 失败的 patch 详情',
++              '',
++              failed,
++              '',
++              '## 修复步骤',
++              '',
++              '1. 看 [workflow 运行日志](' + runUrl + ') 拿到失败上下文',
++              '2. 本地拉最新代码:',
++              '   ```bash',
++              '   git pull origin main',
++              '   ```',
++              '3. 基于最新 baseline 重新应用修改,再生成 patch:',
++              '   ```bash',
++              '   # 编辑 danmu_api/apis/dandan-api.js 加回 handleGetMatch(参考 .github/workflows/01-get-match.patch)',
++              '   # 编辑 danmu_api/worker.js 加回 import 和 GET /match 路由',
++              '   git diff > .github/workflows/01-get-match.patch',
++              '   git add -A && git commit -m "chore: refresh local patch" && git push',
++              '   ```',
++              '4. 关闭本 issue',
++              '',
++              '## 影响',
++              '',
++              '- 失败期间,senplayer 用 GET `/api/v2/match` 搜本地文件会失败(因为 GET 端点被 sync 覆盖了)',
++              '- 其他工作流不受影响,Netlify 部署的是未打 patch 的版本',
++              '- 修复前可以临时手动在 senplayer 搜索框输剧名(去掉技术后缀)走 `/search/anime`',
++            ].join('\n');
++
++            await github.rest.issues.create({
++              owner: context.repo.owner,
++              repo: context.repo.repo,
++              title,
++              body,
++              labels: ['patch-failed', 'maintenance'],
++            });
++            core.info('已创建 patch-failed issue');
 diff --git a/danmu_api/apis/dandan-api.js b/danmu_api/apis/dandan-api.js
 index c7bcfd3..c3bd91c 100644
 --- a/danmu_api/apis/dandan-api.js
