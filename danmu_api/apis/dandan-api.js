@@ -1400,42 +1400,6 @@ export async function extractTitleSeasonEpisode(cleanFileName) {
   return {title, season, episode, year};
 }
 
-// Extracted function for GET /api/v2/match?fileName=xxx
-// 兼容弹弹play协议 — 部分播放器(如senplayer)无法发POST,
-// 会把完整文件名拼到 query string 上发GET。这里造一个假 req 转发到 matchAnime。
-export async function handleGetMatch(url, clientIp) {
-  const fileName = url.searchParams.get("fileName");
-  if (!fileName) {
-    return jsonResponse(
-      { errorCode: 400, success: false, errorMessage: "Missing fileName query parameter" },
-      400
-    );
-  }
-  log("info", `[GET /match] Received fileName: ${fileName}`);
-
-  // 直接走 matchAnime 内部逻辑(不经过它的 req.json() 入口,因为 GET 无 body)
-  // 重构:在 matchAnime 内做"GET 优先取 query"的处理;
-  // 这里用一个轻量级 hack — 让 fakeReq.json() 返回 { fileName }
-  const fakeReq = {
-    json: async () => ({ fileName }),
-    // 传完整 URL(不是 path+search),因为 matchAnime 内部会做
-    // new URL(req.url.replace("/match", "/search/anime?..."))
-    // 用绝对路径会触发 "Invalid URL"
-    url: url.toString(),
-  };
-
-  try {
-    return await matchAnime(url, fakeReq, clientIp);
-  } catch (e) {
-    // GET 路径上若 matchAnime 因其他原因抛错,这里兜住
-    log("error", `[GET /match] matchAnime threw: ${e.message}`);
-    return jsonResponse(
-      { errorCode: 500, success: false, errorMessage: e.message },
-      500
-    );
-  }
-}
-
 // Extracted function for POST /api/v2/match
 export async function matchAnime(url, req, clientIp) {
   try {
