@@ -1,0 +1,79 @@
+name: Apply Local Patches (post fork sync)
+
+# 本地 patch 维护工具 — fork sync workflow (sync_fork.yml) 跑完后自动重打本仓库的本地修改。
+# 之所以用这种方案:仓库是从 huangxd-/danmu_api 拉来的"伪 fork",上游
+# `git checkout upstream/main -- .` 会把本地改动覆盖掉。这里只把 patch 文件放在
+# .github/workflows/ 下(同步排除目录),sync 完成后自动 apply,Netlify 部署时拿到的是
+# "上游 + 本地 patch" 的合并代码。
+
+on:
+  workflow_run:
+    workflows: ["Fork Sync"]
+    types: [completed]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  apply-patches:
+    name: Apply *.patch files under .github/workflows/
+    runs-on: ubuntu-latest
+    # 失败时继续:即便 patch 重打失败,也不阻塞(Netlify 部署的是没打 patch 的版本,
+    # 至少和没改之前一样能用,只是丢掉了这个本地特性)。
+    continue-on-error: true
+    steps:
+      - name: Checkout this repo
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Apply local patches
+        run: |
+          set -e
+          shopt -s nullglob
+          patches=(.github/workflows/*.patch)
+          if [ ${#patches[@]} -eq 0 ]; then
+            echo "No .patch files found under .github/workflows/, nothing to do."
+            exit 0
+          fi
+
+          for patch in "${patches[@]}"; do
+            echo "==================================================="
+            echo "Applying: $patch"
+            echo "==================================================="
+
+            # 先 dry-run 检查能否 apply,失败则打印 diff 上下文方便排查
+            if ! git apply --check --3way "$patch"; then
+              echo "::error::Patch $patch cannot be applied cleanly. The fork sync may have rewritten the target file. Manual rebase required."
+              echo "--- 上下文(±20 行) ---"
+              # 从 patch 里抽 a/ 路径,显示该文件前后 20 行
+              target=$(grep -m1 '^diff --git' "$patch" | awk '{print $3}' | sed 's|^a/||')
+              if [ -f "$target" ]; then
+                sed -n '1,40p' "$target"
+              fi
+              exit 1
+            fi
+
+            git apply --3way "$patch"
+            echo "OK: $patch"
+          done
+
+      - name: Commit and push
+        run: |
+          if git diff --quiet; then
+            echo "No effective changes from patches, skipping commit."
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "chore: apply local patches after fork sync"
+          git push origin main
+          echo "Pushed patched code to main → Netlify will redeploy automatically."
+
+      - name: Notify on failure
+        if: failure()
+        run: |
+          echo "::warning::Local patch apply failed. Last deployed version is from before the sync. Please check workflow logs and rebase patches manually."

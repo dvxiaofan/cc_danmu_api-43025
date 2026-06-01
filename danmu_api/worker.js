@@ -6,7 +6,7 @@ import { cleanupExpiredIPs, findUrlById, getCommentCache, getLocalCaches, judgeL
 import { formatDanmuResponse } from "./utils/danmu-util.js";
 import AIClient from './utils/ai-util.js';
 import { initBangumiData } from "./utils/bangumi-data-util.js";
-import { getBangumi, getComment, getCommentByUrl, getSegmentComment, matchAnime, searchAnime, searchEpisodes } from "./apis/dandan-api.js";
+import { getBangumi, getComment, getCommentByUrl, getSegmentComment, handleGetMatch, matchAnime, searchAnime, searchEpisodes } from "./apis/dandan-api.js";
 import { getFongmiDanmaku } from "./apis/clients/fongmi-api.js";
 import { handleConfig, handleUI, handleLogs, handleClearLogs, handleDeploy, handleClearCache, handleReqRecords, handleCacheAnimes } from "./apis/system-api.js";
 import { handleSetEnv, handleAddEnv, handleDelEnv, handleAiVerify } from "./apis/env-api.js";
@@ -327,7 +327,12 @@ async function handleRequest(req, env, deployPlatform, clientIp, ctx) {
     return getFongmiDanmaku(url, req);
   }
 
-  // GET /api/v2/match
+  // GET /api/v2/match?fileName=xxx
+  if (path === "/api/v2/match" && method === "GET") {
+    return handleGetMatch(url, clientIp);
+  }
+
+  // POST /api/v2/match
   if (path === "/api/v2/match" && method === "POST") {
     return matchAnime(url, req, clientIp);
   }
