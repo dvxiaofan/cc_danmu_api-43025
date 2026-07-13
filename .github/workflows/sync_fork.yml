@@ -1,4 +1,4 @@
-name: Fork Sync
+name: Fork Sync + Deploy
 
 permissions:
     contents: write
@@ -8,9 +8,12 @@ on:
         - cron: "23 18 * * *"  # 每天 02:23(北京) 同步上游
     workflow_dispatch:
 
+# 本仓库是 huangxd-/danmu_api 的"伪 fork"。上游通过 `git checkout upstream/main -- .`
+# 整树覆盖来更新，会冲掉我们自己的本地优化（GET /api/v2/match 兼容 SenPlayer 等）。
+# 对策：同步时把我们的改动文件加入 exclude 清单保护起来，同步完直接 wrangler deploy 上线。
 jobs:
-    sync_with_upstream:
-        name: Sync code from upstream
+    sync_and_deploy:
+        name: Sync upstream then deploy to Cloudflare Workers
         runs-on: ubuntu-latest
         steps:
             - name: Checkout target repo
@@ -19,19 +22,49 @@ jobs:
                   fetch-depth: 0
                   token: ${{ secrets.GITHUB_TOKEN }}
 
-            - name: Sync code from upstream (keep our workflows)
+            - name: Sync code from upstream (keep our workflows + local patches)
               run: |
                   set -e
                   git config user.name  "github-actions[bot]"
                   git config user.email "github-actions[bot]@users.noreply.github.com"
-                  git remote add upstream https://github.com/huangxd-/danmu_api.git
+                  git remote add upstream https://github.com/huangxd-/danmu_api.git || true
                   git fetch upstream main
-                  # 用上游最新内容覆盖工作区，但排除 .github/workflows（保护本同步脚本）
-                  git checkout upstream/main -- . ':(exclude).github/workflows'
+                  # 用上游最新内容覆盖工作区，但排除以下目录/文件（保护本地优化）：
+                  #   - .github/workflows        本同步脚本自身
+                  #   - danmu_api/worker.js      我们加了 GET /api/v2/match 路由
+                  #   - danmu_api/apis/dandan-api.js  我们加了 handleGetMatch()
+                  #   - danmu_api/esm-shim.js    CF 用不到的死代码(Node 路径用 .cjs 版),删掉后别让 sync 复活
+                  git checkout upstream/main -- . \
+                      ':(exclude).github/workflows' \
+                      ':(exclude)danmu_api/worker.js' \
+                      ':(exclude)danmu_api/apis/dandan-api.js' \
+                      ':(exclude)danmu_api/esm-shim.js'
                   if git diff --cached --quiet; then
-                      echo "上游无新变更，跳过"
-                      exit 0
+                      echo "上游无新变更，跳过提交"
+                  else
+                      git commit -m "chore(sync): 同步上游 huangxd-/danmu_api 最新代码"
+                      git push origin main
+                      echo "同步完成"
                   fi
-                  git commit -m "chore(sync): 同步上游 huangxd-/danmu_api 最新代码"
-                  git push origin main
-                  echo "同步完成"
+
+            - name: Setup Node.js
+              uses: actions/setup-node@v4
+              with:
+                  node-version: "20"
+
+            - name: Install wrangler
+              run: npm install -g wrangler
+
+            - name: Deploy to Cloudflare Workers
+              # 部署需 CLOUDFLARE_API_TOKEN（在 repo Settings > Secrets 配置）。
+              # 未配置时 continue-on-error 避免整条 workflow 红（同步本身已成功）。
+              continue-on-error: true
+              env:
+                  CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+              run: |
+                  if [ -z "$CLOUDFLARE_API_TOKEN" ]; then
+                    echo "::warning::CLOUDFLARE_API_TOKEN 未配置,跳过自动部署。请在 repo Settings > Secrets 添加后手动跑一次 workflow。"
+                    exit 0
+                  fi
+                  npx wrangler deploy
+                  echo "部署完成"
