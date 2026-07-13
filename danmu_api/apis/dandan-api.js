@@ -1481,6 +1481,38 @@ export function buildSearchAnimeUrl(baseUrl, keyword, season, episode) {
   return searchUrl;
 }
 
+// GET /api/v2/match?fileName=xxx 的兼容处理
+// 部分播放器(如 SenPlayer)无法发 POST,会把完整文件名拼到 query string 上发 GET。
+// 这里从 query 取出 fileName,构造一个带 json() 的假 req 复用 matchAnime 内部逻辑。
+export async function handleGetMatch(url, clientIp) {
+  const fileName = url.searchParams.get("fileName");
+  if (!fileName) {
+    log("error", "[system] [Match] Missing fileName query parameter in GET /match");
+    return jsonResponse(
+      { errorCode: 400, success: false, errorMessage: "Missing fileName query parameter" },
+      400
+    );
+  }
+  log("info", `[system] [Match] GET /match received fileName: ${fileName}`);
+
+  // matchAnime 内部用 req.json() 取 fileName,这里造一个带 json() 的假 req 喂进去,
+  // 同时把完整 URL 透传(避免它内部 new URL(req.url...) 时找不到路径)。
+  const fakeReq = {
+    json: async () => ({ fileName }),
+    url: url.toString(),
+  };
+
+  try {
+    return await matchAnime(url, fakeReq, clientIp);
+  } catch (e) {
+    log("error", `[system] [Match] GET /match matchAnime threw: ${e.message}`);
+    return jsonResponse(
+      { errorCode: 500, success: false, errorMessage: e.message },
+      500
+    );
+  }
+}
+
 // Extracted function for POST /api/v2/match
 export async function matchAnime(url, req, clientIp) {
   try {
