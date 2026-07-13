@@ -53,7 +53,6 @@ jobs:
                   node-version: "20"
 
             - name: DEBUG token fingerprint (TEMP - will revert)
-              if: env.CF_DEBUG == '1'
               env:
                   CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
               run: |
