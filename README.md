@@ -588,12 +588,18 @@ API 支持返回 Bilibili 标准 XML 格式的弹幕数据，通过查询参数 
 ## 项目结构
 ```
 ├── .gitignore
+├── .github/
+│   └── workflows/
+│       ├── docker-image.yml     # Docker 镜像构建与推送
+│       ├── sync_fork.yml        # Fork 仓库自动同步
+│       └── sync_hf.yml          # Hugging Face Space 同步
 ├── build-forward-widget.js     # 构建forward弹幕插件脚本
 ├── Dockerfile
 ├── edgeone.json                # edgeone pages 配置文件
 ├── LICENSE
 ├── netlify.toml                # netlify 配置文件
 ├── package.json
+├── README.hf.md                # Hugging Face Space 部署说明
 ├── README.md
 ├── vercel.json                 # vercel 配置文件
 ├── wrangler.toml               # cloudflare worker 配置文件
@@ -605,17 +611,21 @@ API 支持返回 Bilibili 标准 XML 格式的弹幕数据，通过查询参数 
 │   ├── worker.js               # 主 API 服务器代码
 │   ├── worker.test.js          # 测试文件
 │   ├── apis/
+│   │   ├── clients/
+│   │   │   └── fongmi-api.js   # FongMi影视兼容接口
 │   │   ├── dandan-api.js       # 弹弹play兼容接口函数
 │   │   ├── env-api.js          # 环境变量接口函数
+│   │   ├── forward-trace-api.js # Forward 调试日志回传接口
 │   │   └── system-api.js       # 系统管理接口函数
 │   ├── configs/
 │   │   ├── envs.js             # 环境变量处理脚本
-│   │   └── globals.js          # 全局变量处理脚本
+│   │   ├── globals.js          # 全局变量处理脚本
 │   │   └── handlers/           # 部署平台API调用及环境变量处理类
 │   │       ├── base-handler.js
 │   │       ├── cloudflare-handler.js
 │   │       ├── edgeone-handler.js
 │   │       ├── handler-factory.js
+│   │       ├── huggingface-handler.js
 │   │       ├── netlify-handler.js
 │   │       ├── node-handler.js
 │   │       └── vercel-handler.js
@@ -653,7 +663,8 @@ API 支持返回 Bilibili 标准 XML 格式的弹幕数据，通过查询参数 
 │   │   │   ├── base.css.js     # 基础样式
 │   │   │   ├── components.css.js # 组件样式
 │   │   │   ├── forms.css.js    # 表单样式
-│   │   │   └── responsive.css.js # 响应式样式
+│   │   │   ├── responsive.css.js # 响应式样式
+│   │   │   └── themes.css.js   # 管理界面主题样式
 │   │   └── js/
 │   │       ├── apitest.js      # API测试脚本
 │   │       ├── logview.js      # 日志查看脚本
@@ -670,6 +681,7 @@ API 支持返回 Bilibili 标准 XML 格式的弹幕数据，通过查询参数 
 │       ├── codec-util.js       # 编解码工具
 │       ├── common-util.js      # 通用工具
 │       ├── cookie-util.js      # b站 cookie获取工具
+│       ├── dan-any.js          # dan-any 弹幕格式转换工具
 │       ├── danmu-util.js       # 弹幕处理工具
 │       ├── douban-util.js      # 豆瓣API请求工具
 │       ├── hanjutv-util.js     # 韩剧tv加解密工具
