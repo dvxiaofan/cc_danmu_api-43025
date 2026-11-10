@@ -1,70 +1,34 @@
-# cc_danmu_api-43025 运维说明（Fork 专用）
+# cc_danmu_api-43025 运维说明（历史记录）
 
-> **这份文档是写给「接手这个 fork 的人 / AI」看的。**
-> 上游 README.md 是上游项目的完整文档（870 行，每轮 sync 会被覆盖），讲的是「这个服务是什么」。
-> 本文档讲的是**「这个 fork 和上游有什么不一样、现在有哪些坑、出问题怎么查、怎么改才不会下次又炸」**。
->
-> 两者配合使用：先读上游 README 了解功能，本文档了解 fork 特有的处境。
+> **2026-11-10 更新：本 fork 已按方案 C 全量跟随上游 v1.21.9。**
+> GET /match 补丁、整文件冻结和 `scripts/apply-local-patch.mjs` 都已删除。
+> 当前操作入口是 `AGENTS.md`；本文以下内容是修复前的历史记录，仅供复盘，部分命令和结论已过时。
 
 ---
 
-## 0. 三十秒速览
+## 当前状态
 
 | 项 | 值 |
 |---|---|
-| 这是什么 | 弹弹播放（DanDanPlay）协议兼容的弹幕 API 服务，部署在 Cloudflare Workers |
-| 本 fork 定位 | 上游 `huangxd-/danmu_api` 的**伪 fork**（只跟随上游代码，不改上游仓库） |
-| 线上地址 | `https://dm.ccucc.de5.net/<TOKEN>`（`<TOKEN>` 是 URL 里的鉴权 token） |
-| Worker 名 | `danmu-api`（CF Account `<CF_ACCOUNT_ID>`） |
-| 本地仓库 | `/Users/ccfun/Desktop/CCFUN/ai-coding/cc_danmu_api-43025` |
-| **线上跑的版本** | **v1.19.14（2026-07-15 部署）** —— 落后上游 4 个月 |
-| **仓库代码的版本** | v1.21.9（跟上了）—— **但当前仓库状态编译不过** |
-| **本地独有功能** | 仅一处：`GET /api/v2/match?fileName=` |
-| **当前最急的事** | ① CI 部署挂了 4 个月 ② 仓库 build 失败 ③ 没配 Redis 导致弹幕接口拿不到数据 ④ 冻结的 worker.js 缺 11~13 个上游路由（口径不同，见 §4） |
+| 线上版本 | v1.19.14（截至 2026-11-10，待本次部署后更新） |
+| 仓库版本 | v1.21.9 |
+| 本地代码补丁 | 无（GET /match 已放弃） |
+| 验证状态 | build 通过；测试 873/873 通过 |
+| CI 状态 | 已改为「安装依赖 → 测试 → 编译检查 → 部署」，失败会变红 |
+| 管理页面 | 未配 ADMIN_TOKEN；升级后管理接口 401，日常不用可忽略 |
+| Redis | 未配；按 episodeId 取弹幕可能偶发 404，需要时再配 Upstash |
 
+### 你现在需要知道的
 
-### 文档地图
-
-| 文件 | 什么时候看 |
-|---|---|
-| `AGENTS.md` | **AI / 新人的入口**（Claude Code / Codex / Cursor 会自动读取）。30 秒速览 + 铁律 |
-| `CLAUDE.md` | Claude Code 的自动入口，指向 AGENTS.md |
-| **`docs/FORK_NOTES.md`** | **本文**。fork 专属：本地补丁原理、8 个已知事故根因链、修复方案 A/B/C、v1.21.9 升级路径、排查手册、接手清单 |
-| `docs/INDEX.md` | 索引 + 四句话现状 |
-| `README.md` | **上游原文**（每轮 sync 覆盖），**不含本 fork 任何特殊性** —— 别拿它当项目文档 |
-| `scripts/apply-local-patch.mjs` | 幂等重打 GET/match 补丁；锚点失配 exit 1。已实测 build 通过 |
+1. 播放器日常使用：搜索、匹配、取弹幕；没有 GET /match，手动搜弹幕即可。
+2. 不要运行 `scripts/apply-local-patch.mjs`（已删除）。
+3. 改环境变量请用 Cloudflare Dashboard 或 `wrangler secret put`；线上 `DEPLOY_PLATFROM_*` 为空，`/api/env/set` 不可用。
+4. 管理页面不用就不配 `ADMIN_TOKEN`；升级后它会自动锁成 401，不影响播放。
+5. 如果实际使用时经常「搜到剧但弹幕加载不出来」，再注册 Upstash 免费 Redis，填两个 Secret。
 
 ---
 
-### 版本号从哪读出来的（别猜，实测方法在这）
-
-| 版本号 | 出处 | 怎么查（实测可用） |
-|---|---|---|
-| 线上 v1.19.14 | Worker 运行时的 `globals.VERSION` | `curl -s "https://dm.ccucc.de5.net/<TOKEN>/api/config" \| grep -o '"version":"[^"]*"'` → `"version":"1.19.14"` |
-| 线上 v1.19.14（另一路） | UI 首页渲染的版本串 | `curl -s "https://dm.ccucc.de5.net/<TOKEN>/" \| grep -oE 'v[0-9]+\.[0-9]+\.[0-9]+' \| head -1` → `v1.19.14` |
-| 仓库 v1.21.9 | `danmu_api/configs/globals.js` 的 `VERSION` 常量 | `grep -n "VERSION:" danmu_api/configs/globals.js` → `VERSION: '1.21.9'` |
-| 上游最新 | GitHub tags | `gh api repos/huangxd-/danmu_api/tags --jq '.[].name' \| head` |
-| 仓库 commit | git | `git log --oneline -1` → 当前 `8b01464 chore(sync): 同步上游 ...` |
-
-> 注意：**版本号不在 `ui/template.js`**，在 `configs/globals.js` 的 `VERSION` 常量。
-> UI 首页和 `/api/config` 里的版本号 = **实际跑着的代码**的版本号，比 git commit 更直观 ——
-> 它能直接回答「线上到底是不是新代码」。
-
-### 线上 v1.19.14 相比仓库 v1.21.9，缺了什么
-
-跨 4 个月，主要功能差距：
-
-| 能力 | 线上 v1.19.14 | 仓库 v1.21.9 |
-|---|---|---|
-| `/api/v2/favorite/*` 收藏（10 个接口） | ❌ 404 | ✅ |
-| `/api/local-danmu/*` 本地弹幕 | ❌ 404 | ✅ |
-| `/api/auto-match-mapping/refresh` | ❌ 404 | ✅ |
-| `/api/title-mapping/refresh` | ❌ 404 | ✅ |
-| `/api/nipaplay/verify` | ❌ 404 | ✅ |
-| 管理接口 admin 强制校验 | ❌ 无（事故 5） | ✅ 有 |
-| 匹配流程（`parseFileName`/`extractTitleSeasonEpisode`） | 旧版 | 新版（更准） |
-
----
+## 历史记录（修复前）
 
 ## 1. 血缘关系：什么是「伪 fork」
 

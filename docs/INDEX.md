@@ -1,39 +1,32 @@
 # 弹幕 API 服务（cc_danmu_api-43025）
 
-Cloudflare Workers 上的弹弹播放（DanDanPlay）协议兼容弹幕 API 服务。
+Cloudflare Workers 上的弹弹播放（DanDanPlay）协议兼容弹幕 API。
 上游 `huangxd-/danmu_api` 的伪 fork。
 
-**线上**：`https://dm.ccucc.de5.net/<TOKEN>`（`<TOKEN>` 是 URL 里的鉴权 token）
+**线上**：`https://dm.ccucc.de5.net/<TOKEN>`（`<TOKEN>` 是普通鉴权 token）
+
+## 当前状态（2026-11-10）
+
+1. 已放弃 `GET /api/v2/match` 补丁，全量跟随上游 **v1.21.9**。
+2. 仓库代码 build 通过，测试 **873/873** 通过。
+3. CI 已改为安装依赖 → 测试 → 编译检查 → 部署，失败会变红。
+4. 线上仍是 **v1.19.14**，待本次部署后更新。
+5. 未配 `ADMIN_TOKEN`：升级后管理页面 401，日常播放不受影响。
+6. 未配 Redis：按 episodeId 取弹幕可能偶发 404；需要时再配 Upstash。
 
 ## 文档
 
 | 文档 | 用途 |
 |---|---|
-| [AGENTS.md](../AGENTS.md) | **给 AI / 新人的入口** —— 30 秒速览 + 伪 fork 铁律 + 别犯的错。多数工具（Claude Code / Codex / Cursor）会**自动读取** |
-| [CLAUDE.md](../CLAUDE.md) | Claude Code 的自动入口，内容指向 AGENTS.md |
-| [docs/FORK_NOTES.md](docs/FORK_NOTES.md) | **先看这个** —— fork 专属运维说明：本地补丁、已知事故、修复方案、升级路径、排查手册、接手清单 |
-| [README.md](README.md) | 上游项目的完整功能文档（870 行，每轮 sync 会被覆盖，**不含本 fork 特殊性**，理解上游功能用） |
+| [AGENTS.md](../AGENTS.md) | **当前操作入口**：状态、同步策略、常用命令、限制 |
+| [CLAUDE.md](../CLAUDE.md) | Claude Code 自动入口，指向 AGENTS.md |
+| [docs/FORK_NOTES.md](FORK_NOTES.md) | 修复前的历史事故记录，仅供复盘，部分内容已过时 |
+| [README.md](../README.md) | 上游完整功能文档（每轮 sync 覆盖，不含本 fork 特殊性） |
 
-## 可直接用的脚本
-
-| 脚本 | 用途 |
-|---|---|
-| `scripts/apply-local-patch.mjs` | 幂等地把本 fork 的 GET /match 补丁打回同步后的代码。锚点失配会 exit 1（强制 CI 变红）。已实测：打补丁后 build 通过（5023 KiB，0 errors） |
-
-## 快速上手
+## 快速验证
 
 ```bash
-npm install --registry=https://registry.npmmirror.com
-cp .env.example .env
-npm start                        # Node/Express，端口 9321
-npx wrangler deploy --dry-run    # 验证 Worker build 是否通过
+cd /Users/ccfun/Desktop/CCFUN/ai-coding/cc_danmu_api-43025
+npm test
+npx wrangler deploy --dry-run
 ```
-
-## 四句话说清现状
-
-1. 线上跑的是 **v1.19.14**，仓库代码是 **v1.21.9** —— CI 部署从 2026-07-19 起一直失败，且被 `continue-on-error` 掩盖成绿的。
-2. 仓库当前 **build 不过** —— sync 的整文件冻结策略撞上上游删导出函数。
-3. 本地只有一处独有功能：`GET /api/v2/match?fileName=`（兼容 SenPlayer 等只发 GET 的播放器）。
-4. 线上管理接口**当前无 admin 鉴权**（`ADMIN_TOKEN` 未配）—— 但上游 1.21.9 已修，升级会自动锁上。升级前先配 `ADMIN_TOKEN`，否则升级后管理界面 401。
-
-细节和修复方案全在 [docs/FORK_NOTES.md](docs/FORK_NOTES.md)。
