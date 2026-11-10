@@ -4,3 +4,6 @@ node_modules
 .env
 .cache
 dist
+
+# 本 fork 的 AI 约定文件（全局 gitignore 屏蔽了 CLAUDE.md，这里反屏蔽）
+!CLAUDE.md
