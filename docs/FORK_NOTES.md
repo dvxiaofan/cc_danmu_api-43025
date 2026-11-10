@@ -2,7 +2,9 @@
 
 > **2026-11-10 更新：本 fork 已按方案 C 全量跟随上游 v1.21.9。**
 > GET /match 补丁、整文件冻结和 `scripts/apply-local-patch.mjs` 都已删除。
+> 线上已部署 v1.21.9，Upstash Redis 已配置（`redisValid=true`），`ADMIN_TOKEN` 按需求未配置。
 > 当前操作入口是 `AGENTS.md`；本文以下内容是修复前的历史记录，仅供复盘，部分命令和结论已过时。
+> 当天变更明细和验证结果见 `docs/CHANGELOG.md`。
 
 ---
 
@@ -10,13 +12,13 @@
 
 | 项 | 值 |
 |---|---|
-| 线上版本 | v1.19.14（截至 2026-11-10，待本次部署后更新） |
+| 线上版本 | v1.21.9（2026-11-10 部署并验证） |
 | 仓库版本 | v1.21.9 |
 | 本地代码补丁 | 无（GET /match 已放弃） |
 | 验证状态 | build 通过；测试 873/873 通过 |
 | CI 状态 | 已改为「安装依赖 → 测试 → 编译检查 → 部署」，失败会变红 |
-| 管理页面 | 未配 ADMIN_TOKEN；升级后管理接口 401，日常不用可忽略 |
-| Redis | 未配；按 episodeId 取弹幕可能偶发 404，需要时再配 Upstash |
+| 管理页面 | 未配 ADMIN_TOKEN；管理接口 401 属预期，日常不用可忽略 |
+| Redis | Upstash 已配置；`/api/config` 的 `redisValid` 为 `true` |
 
 ### 你现在需要知道的
 
@@ -24,7 +26,7 @@
 2. 不要运行 `scripts/apply-local-patch.mjs`（已删除）。
 3. 改环境变量请用 Cloudflare Dashboard 或 `wrangler secret put`；线上 `DEPLOY_PLATFROM_*` 为空，`/api/env/set` 不可用。
 4. 管理页面不用就不配 `ADMIN_TOKEN`；升级后它会自动锁成 401，不影响播放。
-5. 如果实际使用时经常「搜到剧但弹幕加载不出来」，再注册 Upstash 免费 Redis，填两个 Secret。
+5. Redis 已配置；如果仍遇到某集没有弹幕，先重试、换源或按 URL 直查，不要重复注册 Upstash。
 
 ---
 
@@ -35,9 +37,9 @@
 ```
 huangxd-/danmu_api  (上游，AGPL-3.0)
         │
-        │  每天 02:23 UTC 自动同步
+        │  每天 02:23（北京）自动同步
         │  git checkout upstream/main -- .
-        │  + exclude 保护 3 个本地文件
+        │  + exclude 保护 fork 文档、AI 约定和 workflow
         ▼
 dvxiaofan/cc_danmu_api-43025  (本 fork，GitHub 上是 upstream 的 fork)
         │
@@ -52,35 +54,23 @@ dm.ccucc.de5.net
 **「伪 fork」的含义**：真正的 fork 会保留完整的 Git 历史（shared history），可以用 `git merge upstream/main` 正常合并。
 本 fork 不是这样 —— 它是**把上游文件整树覆盖到自己的 main 分支**（`git checkout upstream/main -- .`），每次同步产生一个 `chore(sync): 同步上游 ...` 的空提交。
 
-**exclude 清单在哪改**：`.github/workflows/sync_fork.yml` 第 37-41 行：
+**exclude 清单在哪改**：`.github/workflows/sync_fork.yml`。2026-11-10 起只保护：
 
 ```bash
 git checkout upstream/main -- . \
     ':(exclude).github/workflows' \
-    ':(exclude)danmu_api/worker.js' \
-    ':(exclude)danmu_api/apis/dandan-api.js' \
-    ':(exclude)danmu_api/esm-shim.js'
+    ':(exclude)docs' \
+    ':(exclude)AGENTS.md' \
+    ':(exclude)CLAUDE.md' \
+    ':(exclude).gitignore'
 ```
 
 注意 `.github/workflows` **自己就在 exclude 清单里** —— 即 workflow 目录是自保护的，不会被上游覆盖。
 所以 sync 策略的一切改动都落在这一个文件里。
 
-### ⚠️ 清单里有一条**死代码 exclude**：`danmu_api/esm-shim.js`
-
-| 项 | 事实 |
-|---|---|
-| 清单写的路径 | `danmu_api/esm-shim.js` |
-| 实际文件 | `danmu_api/esm-shim.**cjs**`（13876 字节）—— **扩展名写错，该 exclude 从未生效** |
-| 上游 main | **也有** `danmu_api/esm-shim.cjs`（所以每轮 sync 会覆盖回来，但无害，上游版本来是权威的） |
-| 谁在用 | `danmu_api/server.js`（2 处）、`danmu_api/utils/http-util.js`（1 处）；`worker.js` **不引用** → CF 部署路径确实用不到 |
-| 历史 | 上游早期是 `esm-shim.js`（commit `32cb44c` 引入），后来改名 `.cjs`，fork 的 exclude 没跟着改 → 路径失效 |
-
-**清单注释里那句「CF 用不到的死代码(Node 路径用 .cjs 版),删掉后别让 sync 复活」判断正确，
-但因为路径写错，既没删掉也没保护成。** 这条无效 exclude 的实际效果是零，
-唯一作用是让后来者误以为「esm-shim 已被保护」。
-
-**建议**：要么改成 `':(exclude)danmu_api/esm-shim.cjs'` 让它真生效，
-要么直接删掉这条（推荐 —— 让它跟上游走更省心）。**别留着误导人。**
+> 历史记录：旧 exclude 曾整文件冻结 `worker.js`、`dandan-api.js`，并写过一条路径拼错的
+> `danmu_api/esm-shim.js`（实际文件是 `.cjs`，从未生效）。这些冻结已在 2026-11-10 全部移除；
+> 不要再把整文件冻结加回来。
 
 **这带来两个后果，必须记住：**
 
@@ -231,12 +221,15 @@ wrangler 有了 `account_id` 就不必调 `/memberships` 接口（那个接口�
 **② `continue-on-error: true` 掩盖了失败。**
 workflow 里 deploy 步骤带 `continue-on-error: true`，所以即使部署失败，CI 也是绿的。**监控完全失效** —— 老大是人工才发现线上 4 个月没更新。
 
-**当前状态**：线上停留在 **v1.19.14**（2026-07-15 最后一次成功部署），仓库代码已到 v1.21.9。
+**故障期状态（已结束）**：线上曾停留在 **v1.19.14**（2026-07-15 最后一次成功部署），仓库代码已到 v1.21.9。
 最近失败的 run：2026-07-19、2026-07-22 等。
 
-**修复**：
-- 把 `wrangler.toml` 加进 sync 的 exclude 清单，或改用「同步后 re-apply 补丁」机制（§5 方案 A）
-- 删掉 deploy 步骤的 `continue-on-error: true`
+**后续状态（2026-11-10）**：已恢复自动部署，线上 v1.21.9；`continue-on-error` 已移除，
+account ID 改为在 workflow 环境变量中提供，不再依赖会被 sync 覆盖的 `wrangler.toml`。
+
+**当时的修复思路**：
+- 让 deploy 稳定拿到 account ID（最终做法：在 workflow 里设置 `CLOUDFLARE_ACCOUNT_ID`，不依赖 `wrangler.toml`）
+- 删掉 deploy 步骤的 `continue-on-error: true`（已删除）
 - 顺带：token 若有 `User Details:Read` 则更稳，但**加了 `account_id` 就够用了**，不必换 token
 
 **具体改哪几行**（`.github/workflows/sync_fork.yml`）：
@@ -323,6 +316,8 @@ No matching export in "danmu_api/utils/offset-util.js" for import "resolveOffset
 
 ### 事故 3：没配 Redis → 弹幕接口拿不到数据 🟠
 
+> **后续状态（2026-11-10）：已配置 Upstash，线上 `redisValid=true`。以下保留为故障复盘。**
+
 **现象**：
 ```
 GET /api/v2/comment/10002      → HTTP 404, comments: []
@@ -361,11 +356,14 @@ workflow 里有一步名为 `DEBUG token fingerprint (TEMP - will revert)`，
 
 ### 事故 5：管理端点无鉴权（线上 v1.19.14）🔴 —— 升级到 v1.21.9 会自动修复
 
-**实测确认（线上当前状态）**：
+> **后续状态（2026-11-10）：已升级 v1.21.9，管理接口现在返回 401；`ADMIN_TOKEN` 仍未配置。**
+> 以下为 v1.19.14 裸奔时的复盘记录。
+
+**故障时实测（v1.19.14）**：
 
 ```
 ADMIN_TOKEN = ''          ← /api/config 实测，未配置
-redisValid = False        ← 同上，未配 Redis（印证事故 3）
+redisValid = False        ← 故障时未配 Redis（印证事故 3；现已配置）
 ```
 
 用**普通 TOKEN**（非 admin）调用线上管理接口：
@@ -692,24 +690,29 @@ CI 的 `sync_fork.yml` 自己会加 remote，本地没这一步 ——
 → 查上游什么时候删的该导出（`git log -S`），然后决定是解冻该文件还是把该文件升级。
 
 **「弹幕返回空 / comment 404」**
-→ 先查是否配了 Redis（事故 3）。看 `/api/cache/animes` 是否返回空数组。
-→ 再查是不是用了 `/api/v2/comment/<episodeId>`（依赖内存映射）而不是 `?url=` 形式。
+→ 先看 `/api/config` 的 `redisValid` 是否为 `true`（当前应为 `true`）。
+→ 再查源站是否本来没有弹幕；可换成 `/api/v2/comment?url=<页面URL>` 直查，或重试/换源。
 
 **「match 匹配不到」**
-→ 试 `/api/v2/match` POST（原始路径），排除 GET 补丁的问题。
+→ 用 `POST /api/v2/match`；`GET /api/v2/match` 已按方案 C 移除，不要再用 GET 排查。
 
 **「某个接口 404，但上游 README 说有」**
-→ 大概率是冻结的 worker.js 里没这个路由。查上游 main 的 worker.js 有没有（对比 grep `path ===` 分支数）。
-→ 上游 32 个 vs fork 21 个，差的就是这批（见事故 2b）。
+→ 现在 `worker.js` 已跟随上游 v1.21.9；先检查 URL 前缀、`TOKEN` 和请求方法，不要按旧的冻结版排查。
 
 **「某个接口 200 但数据是空的」**
-→ 优先怀疑 Redis 未配置（见事故 3），不是代码 bug。
+→ Redis 已配置时先别怀疑 Redis；检查源站是否有弹幕、URL 是否正确，以及请求是否带了正确 `TOKEN`。
 
 ### 6.5 升级到 v1.21.9 的升级路径（跨越 4 个月，要走完这一节才算升级完）
 
 线上 v1.19.14 → v1.21.9 跨越 4 个月，**不是简单 deploy 就行**。
 
+> **2026-11-10 执行结果：已完成部署，线上 v1.21.9；Redis 已配；按用户要求未配 `ADMIN_TOKEN`，
+> 管理接口 401 视为可接受。以下步骤保留为当时的升级方案，实际操作与本文不同处，以本段结果为准。**
+
 #### 步骤 1：先配 ADMIN_TOKEN（否则升级后管理界面直接 401）
+
+> **实际执行时跳过了这一步。** 用户不使用管理页面，接受升级后管理接口 401。
+> 如果以后需要管理功能，再按下面步骤单独配置。
 
 线上 `ADMIN_TOKEN = ''`（实测）。上游 1.21.9 的 `ADMIN_ONLY_PATH_PATTERNS` 会在未配置时
 对所有管理接口返回 401 —— 升级后 `/api/env/set`、`/api/deploy`、`/api/cache/*`、
@@ -763,7 +766,7 @@ curl -s "https://dm.ccucc.de5.net/<TOKEN>/api/logs" | grep -i "match"
 按 §5 方案 A 改完后，**本地必须先验过**：
 
 ```bash
-npx wrangler deploy --dry-run     # 必须通过（当前状态：失败）
+npx wrangler deploy --dry-run     # 2026-11-10 已通过
 ```
 
 同步后**必须**在 CI 里加同样的 dry-run 作为门禁（失败就别 push），
@@ -771,8 +774,9 @@ npx wrangler deploy --dry-run     # 必须通过（当前状态：失败）
 
 #### 步骤 4：配 Redis（决定弹幕能不能用）
 
-未配 Redis 时 `/api/v2/comment/<id>` 跨请求必 404（事故 3）。
-在 CF Worker 环境变量里加：
+> **2026-11-10 已完成：** Upstash 免费库已配置，线上 `/api/config` 返回 `redisValid=true`。
+
+如果以后要重新配置或轮换，在 CF Worker 环境变量里加：
 
 ```
 UPSTASH_REDIS_REST_URL     = <upstash redis url>
@@ -799,15 +803,15 @@ curl -s "$B/api/v2/search/anime?keyword=凡人修仙传" | head -c 200
 curl -s -X POST "$B/api/v2/match" -H "Content-Type: application/json" \
   -d '{"fileName":"凡人修仙传.S01E01.1080p.mkv"}' | head -c 300
 
-# 3. match（GET = 本地补丁，若保留则必须通）
-curl -s -G "$B/api/v2/match" --data-urlencode "fileName=凡人修仙传.S01E01.1080p.mkv" | head -c 300
+# 3. GET /match 已放弃（本 fork 不再要求通过）
 
 # 4. 管理接口现在应该 401（用普通 TOKEN 调）
 curl -s -X POST "$B/api/env/set" -H "Content-Type: application/json" -d '{"key":"x","value":"1"}'
 # 期望：401（若还是 500/200，说明补丁没生效或 admin 校验没进）
 
-# 5. 用 ADMIN_TOKEN 调管理接口，应该通
-curl -s -X POST "$B/api/cache/clear" -H "Content-Type: application/json" -d '{}'
+# 5. 已配 Redis 时，确认 config
+curl -s "https://dm.ccucc.de5.net/api/config"
+# 期望：envs.redisValid=true
 ```
 
 #### 步骤 6：回滚预案
@@ -882,8 +886,8 @@ CLAUDE.md
 
 | workflow | 作用 | 状态 |
 |---|---|---|
-| `sync_fork.yml` | 每天 02:23（北京）同步上游 → commit → **同一个文件内**直接 `npx wrangler deploy`（第 67-78 行） | ⚠️ deploy 步骤一直失败（事故 1） |
-| `docker-image.yml` | 构建 Docker 镜像 | 与本 fork 无关 |
+| `sync_fork.yml` | 每天 02:23（北京）同步上游 → 测试 → dry-run → commit → `wrangler deploy` | ✅ 2026-11-10 起已恢复正常；最近成功 run `42788037976` |
+| `docker-image.yml` | 构建 Docker 镜像 | ⚠️ 因缺 Docker Hub 密钥会红；与 Cloudflare 服务无关 |
 
 **踩坑提醒**：workflow 里曾用「patch 文件 + `git apply`」方案（`01-get-match.patch` + `99_local_patches.yml`），
 后来废弃改成「整树 checkout + exclude」—— **就是这一步把 build 搞崩的**。改同步策略时别再退回整文件冻结。
@@ -896,12 +900,12 @@ CLAUDE.md
 
 - [ ] 读本文档 + 上游 README
 - [ ] 确认 `git remote -v` 指向 `dvxiaofan/cc_danmu_api-43025`，上游是 `huangxd-/danmu_api`
-- [ ] 在干净 main 上跑 `npx wrangler deploy --dry-run`，**确认能过**（当前状态：过不了，见事故 2）
-- [ ] 查 GitHub Actions 最近 run 是不是绿的（当前状态：假绿，实际 deploy 全失败）
-- [ ] 查 CF Worker 当前部署版本 vs 仓库版本（当前：v1.19.14 vs v1.21.9）
-- [ ] 确认 GET/match 补丁还在，且 build 通过
-- [ ] 确认 ADMIN_TOKEN 是否配置（当前：**没有**，env 接口裸奔）
-- [ ] 确认 Redis 是否配置（当前：**没有**，弹幕接口拿不到数据）
+- [ ] 在干净 main 上跑 `npx wrangler deploy --dry-run`，**确认能过**（2026-11-10：已通过）
+- [ ] 查 GitHub Actions 最近 run 是不是绿的（2026-11-10：`Fork Sync + Deploy` run `42788037976` 成功）
+- [ ] 查 CF Worker 当前部署版本 vs 仓库版本（2026-11-10：均为 v1.21.9）
+- [ ] 确认 GET/match 补丁状态（2026-11-10：已按方案 C 移除，不要恢复）
+- [ ] 确认 ADMIN_TOKEN 是否配置（2026-11-10：未配，管理接口 401 属预期）
+- [ ] 确认 Redis 是否配置（2026-11-10：已配 Upstash，`redisValid=true`）
 - [ ] 确认是否需要把 `<TOKEN>` 轮换（它在 URL 里，视为已泄露）
 - [ ] 修 sync 策略前，先确认**本地补丁到底还有没有人用**
 
